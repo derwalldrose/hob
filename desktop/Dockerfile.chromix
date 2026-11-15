@@ -1,0 +1,74 @@
+# hob-desktop-chromix：hob-desktop 的 Chromix 变体。
+#
+# 与 desktop/Dockerfile 的唯一区别：浏览器从 Google 官方 google-chrome-stable
+# 换成 Chromix（Chromium 内核的反检测构建，github.com/xiaozhou26/Chromix），
+# 通过 wrapper 以原名字 google-chrome-stable 提供（desktopd 按这个名字 spawn，
+# /usr/local/bin 在 PATH 中优先）。
+#
+# 背景（2026-11-15 本机实测）：官方 Chrome 带 CDP/自动化指纹时，Cloudflare
+# dashboard 的 Turnstile 服务端直接判 fail（"There was a problem with
+# verification"，Sign in 永久禁用）；同出口（WARP）下 Chromix v156 静默通过
+# 挑战，提交假凭据能到达业务层（"Incorrect email or password"）。
+#
+# wrapper 固定 --no-sandbox：容器内 unshare 命名空间被拒（Operation not
+# permitted）；desktopd 对 namespace 错误本有自动回退（server.mjs
+# launchBrowser），这里前置避免首次启动失败重试。隔离边界仍是容器本身。
+FROM node:22-bookworm-slim AS node
+
+FROM node:22-bookworm-slim AS deps
+WORKDIR /dd
+COPY desktopd/package.json desktopd/package-lock.json ./
+RUN npm ci --omit=dev
+
+FROM debian:bookworm-slim
+ARG TARGETARCH
+# Chromix 版本（tag）。资产命名：amd64→chromix-linux-x64.zip，arm64→chromix-linux-arm64.zip
+ARG CHROMIX_VERSION=v156.0.8078.79
+# debian:slim 的 dpkg 配置排掉了 /usr/share/locale（镜像瘦身），这里把中文翻译放回来
+RUN printf '%s\n' 'path-include /usr/share/locale/zh_CN/*' 'path-include /usr/share/locale/zh/*' > /etc/dpkg/dpkg.cfg.d/hob-zh-locale
+# locales + localedef：dock、文件管理器、终端等 GTK 程序的界面文字要中文
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates curl gnupg tini tzdata locales unzip \
+    tigervnc-standalone-server \
+    openbox \
+    xdotool xclip scrot x11-utils \
+    tint2 hsetroot \
+    lxterminal pcmanfm mousepad ristretto galculator \
+    adwaita-icon-theme \
+    fonts-liberation fonts-dejavu-core fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji \
+  && rm -rf /var/lib/apt/lists/* \
+  && localedef -i zh_CN -f UTF-8 zh_CN.UTF-8 \
+  && useradd -u 1000 -m -d /data/home -s /usr/sbin/nologin hob \
+  && mkdir -p /data/profiles && chown -R hob:hob /data /usr/lib/locale
+# Chromix：官方 release 按架构取 zip，SHA256 校验后装到 /opt/chromix
+RUN set -eux; \
+    case "$TARGETARCH" in amd64) ziparch=x64 ;; arm64) ziparch=arm64 ;; *) echo "unsupported arch $TARGETARCH"; exit 1 ;; esac; \
+    curl -fsSL "https://github.com/xiaozhou26/Chromix/releases/download/${CHROMIX_VERSION}/chromix-linux-${ziparch}.zip" -o /tmp/chromix.zip; \
+    curl -fsSL "https://github.com/xiaozhou26/Chromix/releases/download/${CHROMIX_VERSION}/SHA256SUMS-linux-${ziparch}" -o /tmp/chromix.sha; \
+    grep "chromix-linux-${ziparch}.zip" /tmp/chromix.sha | sha256sum -c -; \
+    unzip -q /tmp/chromix.zip -d /tmp/chromix-extract; \
+    mv /tmp/chromix-extract/chromix /opt/chromix; \
+    rm -rf /tmp/chromix.zip /tmp/chromix.sha /tmp/chromix-extract; \
+    printf '#!/bin/sh\nexec /opt/chromix/chromix --no-sandbox "$@"\n' > /usr/local/bin/google-chrome-stable; \
+    chmod 0755 /usr/local/bin/google-chrome-stable; \
+    /usr/local/bin/google-chrome-stable --version
+RUN mkdir /shared && chown hob:hob /shared
+ENV LANG=zh_CN.UTF-8 LANGUAGE=zh_CN:zh SHELL=/bin/bash
+COPY chromium-policies.json /etc/chromium/policies/managed/hob.json
+COPY chromium-policies.json /etc/opt/chrome/policies/managed/hob.json
+COPY openbox/rc.xml /etc/xdg/openbox/rc.xml
+COPY wallpaper.png /app/desktop/wallpaper.png
+COPY dock /app/desktop/dock
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+WORKDIR /app
+COPY --from=deps /dd/node_modules ./desktopd/node_modules
+COPY desktopd ./desktopd
+ENV NODE_ENV=production HOME=/data/home
+# wrapper 占住了 google-chrome-stable 名字，browser-kind 检测保持 chrome 分支
+RUN echo chrome > /app/browser-kind
+USER hob
+VOLUME /data
+EXPOSE 6080
+ENTRYPOINT ["tini", "--"]
+CMD ["node", "desktopd/server.mjs"]
