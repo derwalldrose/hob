@@ -42,14 +42,16 @@ RUN apt-get update \
   && useradd -u 1000 -m -d /data/home -s /usr/sbin/nologin hob \
   && mkdir -p /data/profiles && chown -R hob:hob /data /usr/lib/locale
 # Chromix：官方 release 按架构取 zip，SHA256 校验后装到 /opt/chromix
+# 注意：sha256sum -c 按 SHA256SUMS 里记录的文件名（chromix-linux-<arch>.zip，相对路径）
+# 在【当前目录】找文件，所以下载名必须与之一致，且校验前 cd 到 /tmp
 RUN set -eux; \
     case "$TARGETARCH" in amd64) ziparch=x64 ;; arm64) ziparch=arm64 ;; *) echo "unsupported arch $TARGETARCH"; exit 1 ;; esac; \
-    curl -fsSL "https://github.com/xiaozhou26/Chromix/releases/download/${CHROMIX_VERSION}/chromix-linux-${ziparch}.zip" -o /tmp/chromix.zip; \
-    curl -fsSL "https://github.com/xiaozhou26/Chromix/releases/download/${CHROMIX_VERSION}/SHA256SUMS-linux-${ziparch}" -o /tmp/chromix.sha; \
-    grep "chromix-linux-${ziparch}.zip" /tmp/chromix.sha | sha256sum -c -; \
-    unzip -q /tmp/chromix.zip -d /tmp/chromix-extract; \
+    curl -fsSL "https://github.com/xiaozhou26/Chromix/releases/download/${CHROMIX_VERSION}/chromix-linux-${ziparch}.zip" -o "/tmp/chromix-linux-${ziparch}.zip"; \
+    curl -fsSL "https://github.com/xiaozhou26/Chromix/releases/download/${CHROMIX_VERSION}/SHA256SUMS-linux-${ziparch}" -o "/tmp/SHA256SUMS-linux-${ziparch}"; \
+    cd /tmp && grep "chromix-linux-${ziparch}.zip" "SHA256SUMS-linux-${ziparch}" | sha256sum -c -; \
+    unzip -q "/tmp/chromix-linux-${ziparch}.zip" -d /tmp/chromix-extract; \
     mv /tmp/chromix-extract/chromix /opt/chromix; \
-    rm -rf /tmp/chromix.zip /tmp/chromix.sha /tmp/chromix-extract; \
+    rm -rf "/tmp/chromix-linux-${ziparch}.zip" "/tmp/SHA256SUMS-linux-${ziparch}" /tmp/chromix-extract; \
     printf '#!/bin/sh\nexec /opt/chromix/chromix --no-sandbox "$@"\n' > /usr/local/bin/google-chrome-stable; \
     chmod 0755 /usr/local/bin/google-chrome-stable; \
     /usr/local/bin/google-chrome-stable --version
