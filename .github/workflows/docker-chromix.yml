@@ -22,7 +22,7 @@ jobs:
         include:
           - image: hob-desktop-chromix
             context: desktop
-            dockerfile: Dockerfile.chromix
+            dockerfile: desktop/Dockerfile.chromix
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
