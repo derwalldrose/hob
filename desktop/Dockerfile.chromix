@@ -1,18 +1,26 @@
-# hob-desktop-chromix：hob-desktop 的 Chromix 变体。
+# hob-desktop-chromix：hob-desktop 的 Chromix 浏览器变体。
 #
-# 与 desktop/Dockerfile 的唯一区别：浏览器从 Google 官方 google-chrome-stable
-# 换成 Chromix（Chromium 内核的反检测构建，github.com/xiaozhou26/Chromix），
-# 通过 wrapper 以原名字 google-chrome-stable 提供（desktopd 按这个名字 spawn，
-# /usr/local/bin 在 PATH 中优先）。
+# 与 desktop/Dockerfile 的区别：浏览器二进制从 Google 官方/Debian Chromium
+# 换成 Chromix（Chromium 内核的反检测构建，github.com/xiaozhou26/Chromix）。
 #
 # 背景（2026-11-15 本机实测）：官方 Chrome 带 CDP/自动化指纹时，Cloudflare
 # dashboard 的 Turnstile 服务端直接判 fail（"There was a problem with
-# verification"，Sign in 永久禁用）；同出口（WARP）下 Chromix v156 静默通过
-# 挑战，提交假凭据能到达业务层（"Incorrect email or password"）。
+# verification"，Sign in 永久禁用）；同出口（WARP 104.28.x）下 Chromix v156
+# 静默通过挑战，提交假凭据能到达业务层（"Incorrect email or password"）。
 #
-# wrapper 固定 --no-sandbox：容器内 unshare 命名空间被拒（Operation not
-# permitted）；desktopd 对 namespace 错误本有自动回退（server.mjs
-# launchBrowser），这里前置避免首次启动失败重试。隔离边界仍是容器本身。
+# 实现要点：
+#   - apt install chromium（两架构统一，Debian 官方源）：作用是装齐 Chromium
+#     运行时库（libnspr4/libnss3/libatk/libcairo/harfbuzz 等 75 个）+ 字体依赖，
+#     以及 /usr/bin/chromium 名字。不删它。
+#   - chromix release zip（SHA256 校验）装到 /opt/chromix。
+#   - wrapper 放 /usr/local/bin/chromium（PATH 优先于 /usr/bin）：
+#     exec /opt/chromix/chromix --no-sandbox "$@"
+#     desktopd 的 browser-kind 检测走 chromium 分支（spawn "chromium"），
+#     命中 wrapper。
+#   - wrapper 固定 --no-sandbox：容器内 unshare 命名空间被拒
+#     （Operation not permitted）；desktopd 对 namespace 错误本有自动回退
+#     （server.mjs launchBrowser），这里前置避免首次启动失败重试。
+#     隔离边界仍是容器本身。
 FROM node:22-bookworm-slim AS node
 
 FROM node:22-bookworm-slim AS deps
@@ -26,7 +34,7 @@ ARG TARGETARCH
 ARG CHROMIX_VERSION=v156.0.8078.79
 # debian:slim 的 dpkg 配置排掉了 /usr/share/locale（镜像瘦身），这里把中文翻译放回来
 RUN printf '%s\n' 'path-include /usr/share/locale/zh_CN/*' 'path-include /usr/share/locale/zh/*' > /etc/dpkg/dpkg.cfg.d/hob-zh-locale
-# locales + localedef：dock、文件管理器、终端等 GTK 程序的界面文字要中文
+# 与官方 Dockerfile 相同的服务集 + chromium（提供运行时库和 /usr/bin/chromium 名字）
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates curl gnupg tini tzdata locales unzip \
@@ -37,13 +45,16 @@ RUN apt-get update \
     lxterminal pcmanfm mousepad ristretto galculator \
     adwaita-icon-theme \
     fonts-liberation fonts-dejavu-core fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji \
+    chromium \
   && rm -rf /var/lib/apt/lists/* \
   && localedef -i zh_CN -f UTF-8 zh_CN.UTF-8 \
   && useradd -u 1000 -m -d /data/home -s /usr/sbin/nologin hob \
   && mkdir -p /data/profiles && chown -R hob:hob /data /usr/lib/locale
-# Chromix：官方 release 按架构取 zip，SHA256 校验后装到 /opt/chromix
-# 注意：sha256sum -c 按 SHA256SUMS 里记录的文件名（chromix-linux-<arch>.zip，相对路径）
-# 在【当前目录】找文件，所以下载名必须与之一致，且校验前 cd 到 /tmp
+# Chromix：官方 release 按架构取 zip，SHA256 校验后装到 /opt/chromix，
+# 再放 wrapper 覆盖 /usr/bin/chromium 名字（/usr/local/bin 在 PATH 中优先）。
+# 注意：sha256sum -c 按 SHA256SUMS 里记录的文件名（相对路径）在【当前目录】
+# 找文件，所以下载名必须与之一致，且校验前 cd 到 /tmp。
+# 自检必须走 wrapper：chromix 需要 --no-sandbox 才能在容器里起来。
 RUN set -eux; \
     case "$TARGETARCH" in amd64) ziparch=x64 ;; arm64) ziparch=arm64 ;; *) echo "unsupported arch $TARGETARCH"; exit 1 ;; esac; \
     curl -fsSL "https://github.com/xiaozhou26/Chromix/releases/download/${CHROMIX_VERSION}/chromix-linux-${ziparch}.zip" -o "/tmp/chromix-linux-${ziparch}.zip"; \
@@ -52,10 +63,11 @@ RUN set -eux; \
     unzip -q "/tmp/chromix-linux-${ziparch}.zip" -d /tmp/chromix-extract; \
     mv /tmp/chromix-extract/chromix /opt/chromix; \
     rm -rf "/tmp/chromix-linux-${ziparch}.zip" "/tmp/SHA256SUMS-linux-${ziparch}" /tmp/chromix-extract; \
-    printf '#!/bin/sh\nexec /opt/chromix/chromix --no-sandbox "$@"\n' > /usr/local/bin/google-chrome-stable; \
-    chmod 0755 /usr/local/bin/google-chrome-stable; \
-    /usr/local/bin/google-chrome-stable --version
+    printf '#!/bin/sh\nexec /opt/chromix/chromix --no-sandbox "$@"\n' > /usr/local/bin/chromium; \
+    chmod 0755 /usr/local/bin/chromium; \
+    /usr/local/bin/chromium --version
 RUN mkdir /shared && chown hob:hob /shared
+# 终端的 shell 用 bash（hob 是 nologin）；LANG 与官方镜像一致
 ENV LANG=zh_CN.UTF-8 LANGUAGE=zh_CN:zh SHELL=/bin/bash
 COPY chromium-policies.json /etc/chromium/policies/managed/hob.json
 COPY chromium-policies.json /etc/opt/chrome/policies/managed/hob.json
@@ -67,8 +79,9 @@ WORKDIR /app
 COPY --from=deps /dd/node_modules ./desktopd/node_modules
 COPY desktopd ./desktopd
 ENV NODE_ENV=production HOME=/data/home
-# wrapper 占住了 google-chrome-stable 名字，browser-kind 检测保持 chrome 分支
-RUN echo chrome > /app/browser-kind
+# browser-kind 显式写 chromium：desktopd 据此 spawn "chromium"（命中 wrapper）。
+# 不依赖运行时检测，避免 wrapper 名字和检测逻辑耦合。
+RUN echo chromium > /app/browser-kind
 USER hob
 VOLUME /data
 EXPOSE 6080
